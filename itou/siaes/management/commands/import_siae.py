@@ -17,6 +17,7 @@ name instead of hardcoding column numbers as in `field = row[42]`.
 """
 import logging
 import os
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,10 @@ CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 MAIN_DATASET_FILENAME = f"{CURRENT_DIR}/data/2020_06_15_fluxIAE_Structure_15062020_074022.csv"
 
 SECONDARY_DATASET_FILENAME = f"{CURRENT_DIR}/data/2020_06_24_siae_auth_email_and_external_id.csv"
+
+VUE_ANNEXES_FINANCIERES_DATASET_FILENAME = (
+    f"{CURRENT_DIR}/data/2020_06_30_fluxIAE_AnnexeFinanciere_29062020_063002.csv"
+)
 
 # ETTI are deployed all over France without restriction.
 SIAE_CREATION_ALLOWED_KINDS = [Siae.KIND_ETTI]
@@ -94,6 +99,7 @@ def get_main_df(filename=MAIN_DATASET_FILENAME):
             "structure_id_siae": "external_id",
             "structure_code_naf": "naf",
             "structure_denomination": "name",
+            # FIXME ASP recommends s/_admin_/_gestion_/
             "structure_adresse_admin_numero": "street_num",
             "structure_adresse_admin_cplt_num_voie": "street_num_extra",
             "structure_adresse_admin_type_voie": "street_type",
@@ -123,6 +129,21 @@ def get_main_df(filename=MAIN_DATASET_FILENAME):
 
 
 MAIN_DF = get_main_df()
+
+
+def get_df_rows_as_dict(df, external_id):
+    rows = df[df.external_id == external_id].to_dict("records")
+    return rows
+
+
+def get_df_row_as_dict(df, external_id):
+    rows = get_df_rows_as_dict(df, external_id)
+    assert len(rows) <= 1
+    return rows[0] if len(rows) == 1 else None
+
+
+def get_main_df_row_as_dict(external_id):
+    return get_df_row_as_dict(MAIN_DF, external_id)
 
 
 def get_siret_to_external_id():
@@ -177,21 +198,6 @@ def get_secondary_df(filename=SECONDARY_DATASET_FILENAME):
 SECONDARY_DF = get_secondary_df()
 
 
-def get_df_rows_as_dict(df, external_id):
-    rows = df[df.external_id == external_id].to_dict("records")
-    return rows
-
-
-def get_df_row_as_dict(df, external_id):
-    rows = get_df_rows_as_dict(df, external_id)
-    assert len(rows) <= 1
-    return rows[0] if len(rows) == 1 else None
-
-
-def get_main_df_row_as_dict(external_id):
-    return get_df_row_as_dict(MAIN_DF, external_id)
-
-
 def get_secondary_df_row_as_dict(external_id):
     return get_df_row_as_dict(SECONDARY_DF, external_id)
 
@@ -200,7 +206,73 @@ def get_secondary_df_rows_as_dict(external_id):
     return get_df_rows_as_dict(SECONDARY_DF, external_id)
 
 
+def get_vue_annexes_financieres_df(filename=VUE_ANNEXES_FINANCIERES_DATASET_FILENAME):
+    """
+    The "Vue AF - Annexes Financières" is the third ASP export we are using.
+    It enables us to know which siae is or is not "conventionned" as of today.
+    Meaningful columns:
+    - af_id_structure == siae.external_id
+    - af_mesure_dispositif_code == siae.kind (modulo some suffixes)
+    - af_date_fin_effet: consider only AF which have not expired yet
+    - af_etat_annexe_financiere_code FIXME
+    - af_indicateur_suspension FIXME
+    """
+    df = pd.read_csv(
+        filename,
+        sep="|",
+        parse_dates=["af_date_fin_effet"],
+        # Fix `DtypeWarning: Columns (84,86) have mixed types.` warning.
+        low_memory=False,
+    )
+
+    df.rename(
+        columns={
+            "af_id_structure": "external_id",
+            "af_mesure_dispositif_code": "kind",
+            "af_date_fin_effet": "expiration_date",
+        },
+        inplace=True,
+    )
+
+    # Remove useless suffixes used by ASP.
+    df["kind"] = df["kind"].str.replace("_DC", "")
+    df["kind"] = df["kind"].str.replace("_MP", "")
+
+    # Filter out rows with irrelevant data.
+    df = df[df.kind != "FDI"]
+
+    # Ignore structure kinds we have not implemented yet.
+    df = df[df.kind != "EITI"]
+
+    for kind in df.kind:
+        assert kind in EXPECTED_KINDS
+
+    # Replace NaN elements with None.
+    df = df.replace({np.nan: None})
+
+    return df
+
+
+def get_valid_external_ids():
+    valid_external_ids = set()
+    af_df = get_vue_annexes_financieres_df()
+    for index, row in af_df.iterrows():
+        if datetime.now() < row.expiration_date:
+            valid_external_ids.add(row.external_id)
+    for external_id in valid_external_ids:
+        # FIXME investigate why these assertions fail.
+        # assert get_main_df_row_as_dict(external_id=external_id) is not None
+        # assert get_secondary_df_row_as_dict(external_id=external_id) is not None
+        pass
+    return valid_external_ids
+
+
+VALID_EXTERNAL_IDS = get_valid_external_ids()
+
+
 def should_siae_be_created(siae):
+    if siae.external_id not in VALID_EXTERNAL_IDS:
+        return False
     if siae.kind in SIAE_CREATION_ALLOWED_KINDS:
         return True
     return siae.department in SIAE_CREATION_ALLOWED_DEPARTMENTS
@@ -259,10 +331,14 @@ class Command(BaseCommand):
                     siae.save()
 
     def update_existing_siaes(self, dry_run):
-        self.fix_missing_external_ids(dry_run)
         for siae in Siae.objects.filter(source=Siae.SOURCE_ASP).exclude(external_id__isnull=True):
             row = get_main_df_row_as_dict(external_id=siae.external_id)
+
             if row:
+                assert siae.siret[:9] == row["siret"][:9]
+                assert siae.kind in EXPECTED_KINDS
+
+                # Update siae.auth_email when needed.
                 new_auth_email = self.get_new_auth_email(external_id=siae.external_id)
                 if new_auth_email and siae.auth_email != new_auth_email:
                     self.log(
@@ -275,42 +351,50 @@ class Command(BaseCommand):
 
                 if row["siret"] == siae.siret:
                     continue
+
+                # Update siae.siret when needed.
+                if Siae.objects.filter(siret=row["siret"], kind=siae.kind).exists():
+                    self.log(
+                        f"siae.id={siae.id} has changed siret from "
+                        f"{siae.siret} to {row['siret']} but siret already exists (will *not* be updated)"
+                    )
                 else:
-                    assert siae.siret[:9] == row["siret"][:9]
-                    assert siae.kind in EXPECTED_KINDS
-                    if Siae.objects.filter(siret=row["siret"], kind=siae.kind).exists():
-                        self.log(
-                            f"siae.id={siae.id} has changed siret from "
-                            f"{siae.siret} to {row['siret']} but siret already exists (will *not* be updated)"
-                        )
-                    else:
-                        self.log(
-                            f"siae.id={siae.id} has changed siret from "
-                            f"{siae.siret} to {row['siret']} (will be updated)"
-                        )
-                        if not dry_run:
-                            siae.siret = row["siret"]
-                            siae.save()
+                    self.log(
+                        f"siae.id={siae.id} has changed siret from "
+                        f"{siae.siret} to {row['siret']} (will be updated)"
+                    )
+                    if not dry_run:
+                        siae.siret = row["siret"]
+                        siae.save()
                 # FIXME update other fields as well. Or not?
                 # Tricky decision since our users may have updated their data
                 # themselves and we have no record of that.
-            else:
-                if siae.members.count():
-                    self.log(
-                        f"siae.id={siae.id} has members but no longer exists "
-                        f"in latest export (should eventually be deleted "
-                        f"but not this time)"
-                    )
-                    # if not dry_run:
-                    #     siae.delete()
-                else:
-                    self.log(
-                        f"siae.id={siae.id} no longer exists "
-                        f"in latest export (should eventually be deleted "
-                        f"but not this time)"
-                    )
-                    # if not dry_run:
-                    #     siae.delete()
+
+    def disable_expired_siaes(self, dry_run):
+        expired_siaes = set()
+        for siae in Siae.objects.filter(source=Siae.SOURCE_ASP).exclude(external_id__isnull=True):
+            # 136 siaes have expired.
+            if siae.external_id not in VALID_EXTERNAL_IDS:
+                expired_siaes.add(siae)
+                continue
+
+            # 3 siaes have expired.
+            if not get_main_df_row_as_dict(external_id=siae.external_id):
+                expired_siaes.add(siae)
+                continue
+
+            # FIXME fix failing assertion.
+            # if not get_secondary_df_row_as_dict(external_id=siae.external_id):
+            #     expired_siaes.add(siae)
+            #     continue
+
+        self.log(f"A total of {len(expired_siaes)} siaes have expired.")
+
+        total_with_members = len([s for s in expired_siaes if s.members.exists()])
+        self.log(f"{total_with_members} of them have members.")
+
+        total_with_job_applications = len([s for s in expired_siaes if s.jobapplication_set.exists()])
+        self.log(f"{total_with_job_applications} of them have job applications.")
 
     def geocode_siae(self, siae):
         assert siae.address_on_one_line
@@ -393,7 +477,7 @@ class Command(BaseCommand):
 
         # VERY IMPORTANT : external_id is *not* unique!! o_O
         # Several structures can share the same external_id and in this
-        # case they will have the same siret. Note that several structures
+        # case they will have the same siret. Note that several ASP structures
         # can share the same external_id, siret *and* kind o_O
         for external_id in external_ids_with_complete_data:
 
@@ -452,7 +536,11 @@ class Command(BaseCommand):
 
         self.set_logger(options.get("verbosity"))
 
+        self.fix_missing_external_ids(dry_run)
+
         self.update_existing_siaes(dry_run)
+
+        self.disable_expired_siaes(dry_run)
 
         self.create_new_siaes(dry_run)
 
