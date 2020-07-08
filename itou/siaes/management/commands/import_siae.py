@@ -390,11 +390,17 @@ class Command(BaseCommand):
 
         self.log(f"A total of {len(expired_siaes)} siaes have expired.")
 
-        total_with_members = len([s for s in expired_siaes if s.members.exists()])
+        expired_siaes_with_members = [s for s in expired_siaes if s.members.exists()]
+        total_with_members = len(expired_siaes_with_members)
         self.log(f"{total_with_members} of them have members.")
+        for siae in expired_siaes_with_members:
+            self.log(f"siae.id={siae.id} siae.name=\"{siae.display_name}\"")
 
-        total_with_job_applications = len([s for s in expired_siaes if s.jobapplication_set.exists()])
+        expired_siaes_with_job_applications = [s for s in expired_siaes if s.jobapplication_set.exists()]
+        total_with_job_applications = len(expired_siaes_with_job_applications)
         self.log(f"{total_with_job_applications} of them have job applications.")
+        for siae in expired_siaes_with_job_applications:
+            self.log(f"siae.id={siae.id} siae.name=\"{siae.display_name}\"")
 
     def geocode_siae(self, siae):
         assert siae.address_on_one_line
