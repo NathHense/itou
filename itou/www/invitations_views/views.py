@@ -57,7 +57,9 @@ def join_siae(request, invitation_id, template_name="invitations_views/join_siae
     if not invitation.guest_can_join_siae(request):
         raise PermissionDenied()
 
-    if invitation.can_be_accepted:
+    if not invitation.siae.is_active:
+        messages.error(request, _("Cette structure n'est plus active."))
+    elif invitation.can_be_accepted:
         invitation.add_invited_user_to_siae()
         invitation.accept()
         messages.success(request, _(f"Vous êtes désormais membre de l'organisation {invitation.siae.display_name}."))
